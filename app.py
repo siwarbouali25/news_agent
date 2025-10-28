@@ -1,5 +1,5 @@
 # app.py
-import os, re, pandas as pd
+import os, re, hashlib, pandas as pd
 import streamlit as st
 from urllib.parse import urlparse
 from typing import TypedDict, List, Dict, Any
@@ -26,35 +26,63 @@ DATE_COL = "published_date"
 ALL_CATEGORIES = ["Technology","World","Politics","Science","Health","Sports","Culture","Entertainment","Society"]
 
 # =========================
-# GLOBAL CSS (dark cards)
+# GLOBAL CSS (dark, modern)
 # =========================
 st.set_page_config(page_title="News Agent (Local Llama3)", layout="wide")
 st.markdown("""
 <style>
 :root{
-  --bg:#0f1116; --bg-soft:#151822; --text:#e6e9ef; --muted:#8b91a1; --brand:#35c2c1; --border:#2a2f3b;
+  --bg:#0f1116; --bg-soft:#151822; --text:#EDF2F7; --muted:#8b91a1; --brand:#35c2c1; --border:#262b36;
+  --card-grad1:#151a27; --card-grad2:#121723; --btn:#1e232e; --btn-hover:#242a37;
 }
 html, body, [data-testid="stAppViewContainer"]{ background:var(--bg); color:var(--text); }
 [data-testid="stSidebar"]{ background:var(--bg-soft)!important; }
 h1,h2,h3{ color:var(--text) }
 a, a:visited{ color:var(--brand); text-decoration:none; }
 
-.card{
+.card-wrap{
   border:1px solid var(--border);
-  background:linear-gradient(180deg,#141826,#121623);
+  background:linear-gradient(180deg,var(--card-grad1),var(--card-grad2));
   border-radius:18px; padding:16px; height:100%;
-  box-shadow:0 0 0 1px rgba(53,194,193,.08), 0 8px 24px rgba(0,0,0,.35);
+  box-shadow:0 0 0 1px rgba(53,194,193,.06), 0 10px 24px rgba(0,0,0,.35);
+  transition: transform .12s ease, box-shadow .12s ease;
 }
-.card .title{
-  font-weight:700;font-size:1.05rem;line-height:1.3;margin:0 0 6px;color:var(--text);
+.card-wrap:hover{
+  transform: translateY(-1px);
+  box-shadow:0 0 0 1px rgba(53,194,193,.1), 0 14px 28px rgba(0,0,0,.40);
 }
-.card .meta{
-  color:var(--muted);font-size:.9rem;margin:0 0 10px;
+.card-title{ font-weight:700;font-size:1.05rem;line-height:1.3;margin:0 0 6px;color:var(--text); }
+.card-meta{ color:var(--muted);font-size:.9rem;margin:0 0 12px; }
+.card-link{ display:inline-block;color:var(--brand);font-weight:600;margin-bottom:12px; }
+.card-link:hover{ text-decoration:underline; }
+
+/* ===== Buttons inside article cards ===== */
+.card-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 12px;
 }
-.card a.open{
-  display:inline-block;color:var(--brand);font-weight:600;
+
+button[kind="secondary"] {
+  background: var(--btn);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 0.8rem;
+  padding: 4px 8px;
+  border-radius: 10px;
+  transition: all 0.15s ease;
+  height: 32px !important;
+  width: 100%;
 }
-.card a.open:hover{ text-decoration:underline; }
+
+button[kind="secondary"]:hover {
+  background: var(--btn-hover);
+  border-color: var(--brand);
+  color: var(--brand);
+  transform: translateY(-1px);
+  box-shadow: 0 0 6px rgba(53, 194, 193, 0.25);
+}
 
 .section{ margin: 8px 0 22px; font-weight:800; font-size:1.25rem; letter-spacing:.2px; }
 .section .tag{ color:var(--muted); font-weight:600; font-size:1rem; margin-left:.25rem; }
@@ -75,19 +103,6 @@ def pretty_date(date_str):
     except Exception:
         return str(date_str)
 
-def article_card(item: dict):
-    title = item.get("title") or "(Untitled)"
-    url   = item.get("url") or ""
-    src   = item.get("source") or item.get("source_norm") or "Unknown source"
-    dt    = item.get(DATE_COL)
-    st.markdown(f"""
-      <div class="card">
-        <div class="title">{title}</div>
-        <div class="meta">{src} • {pretty_date(dt)}</div>
-        <a class="open" href="{url}" target="_blank">Open article ↗</a>
-      </div>
-    """, unsafe_allow_html=True)
-
 def ollama_chat(prompt: str, max_tokens: int = 220, temperature: float = 0.3) -> str:
     payload = {
         "model": OLLAMA_MODEL,
@@ -98,6 +113,46 @@ def ollama_chat(prompt: str, max_tokens: int = 220, temperature: float = 0.3) ->
     r = requests.post(OLLAMA_URL, json=payload, timeout=120)
     r.raise_for_status()
     return r.json().get("message", {}).get("content", "").strip()
+
+def item_keybase(item: Dict[str, Any]) -> str:
+    raw = (item.get("url") or item.get("title") or "") + (item.get("published_date") or "")
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:10]
+
+def render_card_with_actions(item: Dict[str, Any], keybase: str):
+    """One self-contained card: title, meta, link, then in-card buttons."""
+    title = item.get("title") or "(Untitled)"
+    url   = item.get("url") or ""
+    src   = item.get("source") or item.get("source_norm") or "Unknown source"
+    dt    = item.get(DATE_COL)
+
+    with st.container(border=False):
+        st.markdown(f"""
+        <div class="card-wrap">
+          <div class="card-title">{title}</div>
+          <div class="card-meta">{src} • {pretty_date(dt)}</div>
+          <a class="card-link" href="{url}" target="_blank">Open article ↗</a>
+        """, unsafe_allow_html=True)
+
+        # Inside-card action row
+        st.markdown('<div class="card-actions">', unsafe_allow_html=True)
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("📝 Summarize", key=f"sum-{keybase}", use_container_width=True):
+                st.session_state["pending_action"] = {"type": "summarize", "item": item}
+        with col2:
+            if st.button("🔎 Fact-check", key=f"fact-{keybase}", use_container_width=True):
+                st.session_state["pending_action"] = {"type": "factcheck", "item": item}
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+def doc_to_item(d: Document) -> Dict[str, Any]:
+    m = d.metadata or {}
+    return {
+        "title": m.get("title", "") or "(Untitled)",
+        "url":   m.get("url", "") or "",
+        "source": m.get("source", "") or m.get("source_norm", "") or "Unknown source",
+        "published_date": m.get("published_date", ""),
+    }
 
 # =========================
 # RETRIEVER (FAISS)
@@ -111,7 +166,7 @@ def load_retriever():
     # ensure base columns exist
     for col in ["title","content","url","source",DATE_COL,"category"]:
         if col not in df.columns: df[col] = ""
-    # normalize source for diversity
+    # normalize source
     def _canon(row):
         s = (row.get("source") or "").strip()
         if s: return s
@@ -156,7 +211,7 @@ def format_hits(hits: List[Document], k: int) -> List[Dict[str, Any]]:
         meta = d.metadata or {}
         url = meta.get("url", "")
         domain = urlparse(url).netloc
-        if domain in seen:  # 1/article per domain (diverse sources)
+        if domain in seen:
             continue
         seen.add(domain)
         out.append({
@@ -170,11 +225,10 @@ def format_hits(hits: List[Document], k: int) -> List[Dict[str, Any]]:
 
 # --- compatibility shim for retriever API ---
 def _retrieve(query: str):
-    """Return a list of Documents; supports both old and new LangChain retriever APIs."""
     try:
-        return retriever.get_relevant_documents(query)   # older API
+        return retriever.get_relevant_documents(query)
     except AttributeError:
-        return retriever.invoke(query)                   # newer Runnable retrievers
+        return retriever.invoke(query)
 
 def route(state: State) -> str:
     q = (state["query"] or "").lower().strip()
@@ -200,7 +254,6 @@ def node_llm_answer(state: State) -> State:
     if not docs:
         state["answer"] = "I couldn't find relevant articles to answer that."
         return state
-    # keep context compact for faster, cheaper generations
     max_docs, max_chars = 4, 350
     context = []
     for d in docs[:max_docs]:
@@ -243,7 +296,6 @@ with st.sidebar:
     k = st.slider("Articles per category", 1, 10, 5)
     show_table = st.checkbox("Show raw table", value=False)
 
-# Fetch per-category
 if st.sidebar.button("Get Top Articles"):
     by_cat = {}
     for cat in selected_categories:
@@ -251,7 +303,6 @@ if st.sidebar.button("Get Top Articles"):
         by_cat[cat] = out.get("results", [])
     st.session_state["articles_by_cat"] = by_cat
 
-# Render results
 if "articles_by_cat" in st.session_state:
     for cat, items in st.session_state["articles_by_cat"].items():
         st.markdown(
@@ -264,7 +315,7 @@ if "articles_by_cat" in st.session_state:
         cols = st.columns(3)
         for i, it in enumerate(items):
             with cols[i % 3]:
-                article_card(it)
+                render_card_with_actions(it, keybase=item_keybase(it))
         st.markdown("<hr/>", unsafe_allow_html=True)
         if show_table:
             st.dataframe(pd.DataFrame(items))
@@ -272,8 +323,28 @@ if "articles_by_cat" in st.session_state:
 st.divider()
 st.subheader("💬 Ask a Question")
 user_q = st.text_input("Your question about the news:")
+
 if user_q:
     with st.spinner("Thinking..."):
         resp = graph.invoke({"query": user_q, "k": k, "mode": "", "results": [], "answer": ""})
-        st.markdown("### 🧠 Answer")
-        st.write(resp["answer"])
+
+    st.markdown("### 🧠 Answer")
+    st.write(resp.get("answer", "No answer generated."))
+
+    results = resp.get("results", []) or []
+    if results:
+        if isinstance(results[0], Document):
+            top_items = [doc_to_item(d) for d in results[:3]]
+        else:
+            top_items = results[:3]
+
+        st.markdown("<div class='section'>📰 Related Articles <span class='tag'>(top 3)</span></div>", unsafe_allow_html=True)
+        cols = st.columns(3)
+        for i, it in enumerate(top_items):
+            with cols[i % 3]:
+                render_card_with_actions(it, keybase=item_keybase(it))
+
+if "pending_action" in st.session_state:
+    pa = st.session_state["pending_action"]
+    st.info(f"Requested **{pa['type']}** for: {pa['item'].get('title','(Untitled)')}")
+    # TODO: plug real summarize/fact-check logic here
