@@ -5,4 +5,13 @@ beautifulsoup4
 lxml
 feedparser
 pandas
+streamlit
+langchain
+langgraph
+langchain-community
+langchain-core
+sentence-transformers
+faiss-cpu
 requests
+
+
