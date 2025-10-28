@@ -18,9 +18,6 @@ venv/
 logs/
 
 # Datasets and vector indexes
-*.csv
-*.json
-*.jsonl
 *.faiss
 *.pkl
 faiss_news_index/

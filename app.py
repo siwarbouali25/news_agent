@@ -1,5 +1,5 @@
 # app.py
-import os, re, hashlib, pandas as pd
+import os, re, hashlib, shutil, pandas as pd
 import streamlit as st
 from urllib.parse import urlparse
 from typing import TypedDict, List, Dict, Any
@@ -14,7 +14,7 @@ from langchain_core.documents import Document
 # =========================
 # CONFIG
 # =========================
-CSV_PATH   = os.environ.get("NEWS_CSV", "articles.csv")   # put your CSV here
+CSV_PATH   = os.environ.get("NEWS_CSV", "articles.csv")   # your CSV path
 INDEX_DIR  = os.environ.get("INDEX_DIR", "faiss_news_index")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
@@ -23,6 +23,7 @@ OLLAMA_URL   = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/chat")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3:latest")
 
 DATE_COL = "published_date"
+AID_COL  = "id_article"  # your CSV id column
 ALL_CATEGORIES = ["Technology","World","Politics","Science","Health","Sports","Culture","Entertainment","Society"]
 
 # =========================
@@ -56,37 +57,22 @@ a, a:visited{ color:var(--brand); text-decoration:none; }
 .card-link{ display:inline-block;color:var(--brand);font-weight:600;margin-bottom:12px; }
 .card-link:hover{ text-decoration:underline; }
 
-/* ===== Buttons inside article cards ===== */
-.card-actions {
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  margin-top: 12px;
+.card-actions { display:flex; gap:8px; margin-top:12px; }
+button[kind="secondary"]{
+  background:var(--btn); border:1px solid var(--border); color:var(--text);
+  font-size:.85rem; padding:4px 8px; border-radius:10px; height:32px!important; width:100%;
 }
-
-button[kind="secondary"] {
-  background: var(--btn);
-  border: 1px solid var(--border);
-  color: var(--text);
-  font-size: 0.8rem;
-  padding: 4px 8px;
-  border-radius: 10px;
-  transition: all 0.15s ease;
-  height: 32px !important;
-  width: 100%;
-}
-
-button[kind="secondary"]:hover {
-  background: var(--btn-hover);
-  border-color: var(--brand);
-  color: var(--brand);
-  transform: translateY(-1px);
-  box-shadow: 0 0 6px rgba(53, 194, 193, 0.25);
+button[kind="secondary"]:hover{
+  background:var(--btn-hover); border-color:var(--brand); color:var(--brand); transform:translateY(-1px);
 }
 
 .section{ margin: 8px 0 22px; font-weight:800; font-size:1.25rem; letter-spacing:.2px; }
 .section .tag{ color:var(--muted); font-weight:600; font-size:1rem; margin-left:.25rem; }
 hr{ border-color:var(--border)!important }
+.result-box{
+  border:1px solid var(--border); background:linear-gradient(180deg,#151a27,#121723);
+  border-radius:14px; padding:14px; margin:10px 0;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -115,25 +101,36 @@ def ollama_chat(prompt: str, max_tokens: int = 220, temperature: float = 0.3) ->
     return r.json().get("message", {}).get("content", "").strip()
 
 def item_keybase(item: Dict[str, Any]) -> str:
+    if item.get("id"):  # prefer stable id
+        return str(item["id"])[:10]
     raw = (item.get("url") or item.get("title") or "") + (item.get("published_date") or "")
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:10]
 
 def render_card_with_actions(item: Dict[str, Any], keybase: str):
-    """One self-contained card: title, meta, link, then in-card buttons."""
     title = item.get("title") or "(Untitled)"
     url   = item.get("url") or ""
     src   = item.get("source") or item.get("source_norm") or "Unknown source"
     dt    = item.get(DATE_COL)
+    aid   = item.get("id","")
+
+    # show whether content is present (based on lookup)
+    have_text = False
+    length = 0
+    if aid and aid in ARTICLE_BY_ID:
+        txt = str(ARTICLE_BY_ID[aid].get("content","") or "")
+        have_text, length = (len(txt) > 0), len(txt)
+    badge = "✅ full text" if have_text else "⚠️ no text"
 
     with st.container(border=False):
         st.markdown(f"""
         <div class="card-wrap">
           <div class="card-title">{title}</div>
-          <div class="card-meta">{src} • {pretty_date(dt)}</div>
+          <div class="card-meta">{src} • {pretty_date(dt)}
+            <span style="opacity:.6"> • id:{aid[:8]}</span> • {badge} (len={length})
+          </div>
           <a class="card-link" href="{url}" target="_blank">Open article ↗</a>
         """, unsafe_allow_html=True)
 
-        # Inside-card action row
         st.markdown('<div class="card-actions">', unsafe_allow_html=True)
         col1, col2 = st.columns(2)
         with col1:
@@ -148,25 +145,115 @@ def render_card_with_actions(item: Dict[str, Any], keybase: str):
 def doc_to_item(d: Document) -> Dict[str, Any]:
     m = d.metadata or {}
     return {
+        "id": m.get("id", ""),  # carry id
         "title": m.get("title", "") or "(Untitled)",
         "url":   m.get("url", "") or "",
         "source": m.get("source", "") or m.get("source_norm", "") or "Unknown source",
         "published_date": m.get("published_date", ""),
     }
 
+# ===== Global lookups (filled in load_retriever) =====
+ARTICLE_BY_ID: Dict[str, Dict[str, Any]] = {}
+ARTICLE_BY_URL: Dict[str, Dict[str, Any]] = {}
+
+# =========================
+# SUMMARIZER (FLAN-T5)
+# =========================
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline as hf_pipeline
+import torch
+
+@st.cache_resource(show_spinner=False)
+def load_flan():
+    model_name = "google/flan-t5-base"
+    device = 0 if torch.cuda.is_available() else -1
+    tok = AutoTokenizer.from_pretrained(model_name)
+    mdl = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    return hf_pipeline("text2text-generation", model=mdl, tokenizer=tok, device=device)
+
+flan = load_flan()
+
+def _sum_chunk(text: str, max_new_tokens: int = 180) -> str:
+    prompt = (
+        "Summarize the following news article in 3–5 concise bullet points, factual and neutral:\n\n"
+        f"{text}"
+    )
+    out = flan(prompt, max_new_tokens=max_new_tokens, temperature=0.0, do_sample=False)
+    return out[0]["generated_text"].strip()
+
+def summarize_text_long(text: str) -> str:
+    if not text: return ""
+    CHUNK = 1800  # chars
+    chunks = [text[i:i+CHUNK] for i in range(0, len(text), CHUNK)]
+    parts = [_sum_chunk(c, 160) for c in chunks]
+    if len(parts) == 1:
+        return parts[0]
+    combined = "\n\n".join(parts)
+    final = flan(
+        "Combine these bullet-point summaries into 5–7 bullets, removing redundancy and keeping key facts:\n\n"
+        + combined,
+        max_new_tokens=200,
+        temperature=0.0,
+        do_sample=False
+    )[0]["generated_text"].strip()
+    return final
+
+def get_article_text(item: Dict[str, Any]) -> str:
+    aid = (item.get("id") or "").strip()
+    if aid and aid in ARTICLE_BY_ID:
+        return ARTICLE_BY_ID[aid].get("content","") or ""
+    url = (item.get("url") or "").strip()
+    if url and url in ARTICLE_BY_URL:
+        return ARTICLE_BY_URL[url].get("content","") or ""
+    return ""
+
+def summarize_article(item: Dict[str, Any]) -> str:
+    content = get_article_text(item)
+    if not content:
+        return "_No full text available in dataset to summarize._"
+    try:
+        summary = summarize_text_long(content)
+        return f"**{item.get('title','(Untitled)')}**\n\n{summary}"
+    except Exception as e:
+        return f"_Summary failed: {e}_"
+
+def factcheck_scaffold(item: Dict[str, Any]) -> str:
+    content = get_article_text(item)
+    if not content:
+        return "_No full text available; cannot extract claims for checking._"
+    prompt = (
+        "From the article below, extract up to 3 checkable claims as short bullet points. "
+        "For each claim, add one line 'How to verify:' with suggested authoritative sources "
+        "(official stats, press releases, reputable outlets). Do NOT invent verdicts.\n\n"
+        f"TITLE: {item.get('title','(Untitled)')}\n\nARTICLE:\n{content[:6000]}"
+    )
+    return ollama_chat(prompt, max_tokens=260, temperature=0.2)
+
 # =========================
 # RETRIEVER (FAISS)
 # =========================
 @st.cache_resource
 def load_retriever():
+    # build df
     if not os.path.exists(CSV_PATH):
         st.error(f"CSV not found at {CSV_PATH}. Set NEWS_CSV or put articles.csv beside app.py.")
         st.stop()
     df = pd.read_csv(CSV_PATH).fillna("")
-    # ensure base columns exist
-    for col in ["title","content","url","source",DATE_COL,"category"]:
-        if col not in df.columns: df[col] = ""
-    # normalize source
+
+    # ensure base columns
+    for col in ["title","content","url","source",DATE_COL,"category",AID_COL]:
+        if col not in df.columns:
+            df[col] = ""
+
+    # id normalize (fallback if blank)
+    def _ensure_id(val, row):
+        s = str(val).strip()
+        if s and s.lower() not in ("nan","none","null"):
+            return s
+        base = f"{row.get('url','')}|{row.get(DATE_COL,'')}|{row.get('title','')}"
+        return hashlib.md5(base.encode("utf-8")).hexdigest()
+    df[AID_COL] = df.apply(lambda r: _ensure_id(r.get(AID_COL, ""), r), axis=1)
+
+    # source normalize
     def _canon(row):
         s = (row.get("source") or "").strip()
         if s: return s
@@ -177,13 +264,32 @@ def load_retriever():
         except: return "unknown"
     df["source_norm"] = df.apply(_canon, axis=1)
 
-    docs = [
-        Document(
-            page_content=f"{row['title']}\n\n{row['content']}",
-            metadata={k: str(row[k]) for k in df.columns if k != "content"},
-        )
+    # fast lookups
+    article_by_id = {
+        str(row[AID_COL]): {
+            "id": str(row[AID_COL]),
+            "title": str(row["title"]).strip(),
+            "content": str(row["content"]).strip(),
+            "url": str(row["url"]).strip(),
+            "source": str(row["source"]).strip(),
+            "source_norm": str(row["source_norm"]).strip(),
+            "published_date": str(row[DATE_COL]).strip(),
+            "category": str(row.get("category","")).strip(),
+        }
         for _, row in df.iterrows()
-    ]
+    }
+    article_by_url = {
+        str(row["url"]).strip(): article_by_id[str(row[AID_COL])]
+        for _, row in df.iterrows() if str(row.get("url","")).strip()
+    }
+
+    # FAISS docs (include id)
+    docs = []
+    for _, row in df.iterrows():
+        meta = {k: str(row[k]) for k in df.columns if k != "content"}
+        meta["id"] = str(row[AID_COL])
+        docs.append(Document(page_content=f"{row['title']}\n\n{row['content']}", metadata=meta))
+
     emb = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
     os.makedirs(INDEX_DIR, exist_ok=True)
     if os.path.exists(os.path.join(INDEX_DIR, "index.faiss")):
@@ -191,9 +297,11 @@ def load_retriever():
     else:
         vs = FAISS.from_documents(docs, emb)
         vs.save_local(INDEX_DIR)
-    return vs.as_retriever(search_kwargs={"k": 12})
 
-retriever = load_retriever()
+    # return everything you need on each run
+    return vs.as_retriever(search_kwargs={"k": 12}), article_by_id, article_by_url
+
+retriever, ARTICLE_BY_ID, ARTICLE_BY_URL = load_retriever()
 
 # =========================
 # AGENT (LangGraph)
@@ -215,6 +323,7 @@ def format_hits(hits: List[Document], k: int) -> List[Dict[str, Any]]:
             continue
         seen.add(domain)
         out.append({
+            "id": meta.get("id", ""),  # carry id
             "title": meta.get("title", ""),
             "source": meta.get("source", "") or meta.get("source_norm", ""),
             "published_date": meta.get("published_date", ""),
@@ -223,7 +332,7 @@ def format_hits(hits: List[Document], k: int) -> List[Dict[str, Any]]:
         if len(out) >= k: break
     return out
 
-# --- compatibility shim for retriever API ---
+# compatibility shim for retriever API
 def _retrieve(query: str):
     try:
         return retriever.get_relevant_documents(query)
@@ -344,7 +453,19 @@ if user_q:
             with cols[i % 3]:
                 render_card_with_actions(it, keybase=item_keybase(it))
 
+# ===== Handle card actions (summary / fact-check) =====
 if "pending_action" in st.session_state:
-    pa = st.session_state["pending_action"]
-    st.info(f"Requested **{pa['type']}** for: {pa['item'].get('title','(Untitled)')}")
-    # TODO: plug real summarize/fact-check logic here
+    pa = st.session_state.pop("pending_action")
+    aitem = pa["item"]
+
+    if pa["type"] == "summarize":
+        with st.spinner("Summarizing…"):
+            summary = summarize_article(aitem)
+        st.markdown("#### 📝 Summary")
+        st.markdown(f"<div class='result-box'>{summary}</div>", unsafe_allow_html=True)
+
+    elif pa["type"] == "factcheck":
+        with st.spinner("Preparing fact-check checklist…"):
+            notes = factcheck_scaffold(aitem)
+        st.markdown("#### 🔎 Fact-check checklist (draft)")
+        st.markdown(f"<div class='result-box'>{notes}</div>", unsafe_allow_html=True)
