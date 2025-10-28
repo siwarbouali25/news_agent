@@ -1,0 +1,73 @@
+name: "All feeds"
+output_csv: "out/articles.csv"
+max_per_feed: 60
+pause_seconds: 1.2
+
+feeds:
+  Politics:
+    - "https://feeds.bbci.co.uk/news/politics/rss.xml"
+    - "https://feeds.npr.org/1014/rss.xml"
+    - "https://www.theguardian.com/politics/rss"
+    - "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml"
+    - "https://thehill.com/feed/"
+
+  World (International):
+    - "https://feeds.bbci.co.uk/news/world/rss.xml"
+    - "https://www.reuters.com/rssFeed/worldNews"
+    - "https://www.theguardian.com/world/rss"
+    - "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"
+    - "https://www.aljazeera.com/xml/rss/all.xml"
+
+  Science:
+    - "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml"
+    - "https://www.sciencemag.org/rss/news_current.xml"
+    - "https://www.theguardian.com/science/rss"
+    - "https://www.livescience.com/feeds/all"
+    - "https://rss.nytimes.com/services/xml/rss/nyt/Science.xml"
+
+  Health:
+    - "https://feeds.bbci.co.uk/news/health/rss.xml"
+    - "https://www.statnews.com/feed/"
+    - "https://www.theguardian.com/society/health/rss"
+    - "https://rss.nytimes.com/services/xml/rss/nyt/Health.xml"
+    - "https://feeds.npr.org/1128/rss.xml"
+
+  Sports:
+    - "https://feeds.bbci.co.uk/sport/rss.xml?edition=uk"
+    - "https://www.espn.com/espn/rss/news"
+    - "https://www.theguardian.com/uk/sport/rss"
+    - "https://rss.nytimes.com/services/xml/rss/nyt/Sports.xml"
+    - "https://www.cbssports.com/rss/headlines/"
+
+  Entertainment:
+    - "https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml"
+    - "https://www.reuters.com/rssFeed/entertainmentNews"
+    - "https://www.rollingstone.com/culture/feed/"
+    - "https://rss.nytimes.com/services/xml/rss/nyt/Movies.xml"
+    - "https://variety.com/feed/"
+
+  Culture:
+    - "https://www.bbc.com/culture/feed.rss"
+    - "https://feeds.npr.org/1008/rss.xml"
+    - "https://www.theguardian.com/culture/rss"
+    - "https://rss.nytimes.com/services/xml/rss/nyt/Arts.xml"
+
+  Society:
+    - "https://feeds.bbci.co.uk/news/uk/rss.xml"
+    - "https://www.npr.org/rss/rss.php?id=1128"
+    - "https://www.theguardian.com/society/rss"
+    - "https://rss.nytimes.com/services/xml/rss/nyt/Opinion.xml"
+    - "https://theconversation.com/us/articles.atom"
+
+  Technology:
+    - "https://feeds.bbci.co.uk/news/technology/rss.xml"
+    - "https://www.engadget.com/rss.xml"
+    - "https://www.theguardian.com/uk/technology/rss"
+    - "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml"
+    - "https://www.wired.com/feed/rss"
+
+  Business:
+    - "https://www.cnbc.com/id/10001147/device/rss"
+    - "https://www.theguardian.com/uk/business/rss"
+    - "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml"
+    - "https://www.marketwatch.com/feeds/topstories"

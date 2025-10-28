@@ -1,0 +1,39 @@
+
+out/
+__pycache__/
+*.pyc
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+venv/
+
+# Streamlit cache
+.streamlit/
+logs/
+
+# Datasets and vector indexes
+*.csv
+*.json
+*.jsonl
+*.faiss
+*.pkl
+faiss_news_index/
+index.faiss
+
+# Environment
+.env
+.env.*
+
+# VSCode
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+

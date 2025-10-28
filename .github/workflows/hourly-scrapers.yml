@@ -1,0 +1,51 @@
+name: Hourly Scrapers
+on:
+  schedule: [{ cron: "0 * * * *" }]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # <-- allow committing back to the repo
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: { shard_idx: [0,1,2,3] }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -r requirements.txt
+      - name: Run shard
+        run: |
+          python scraper.py \
+            --config configs/news.yaml \
+            --shards 4 --shard-idx ${{ matrix.shard_idx }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard_idx }}-${{ github.run_id }}
+          path: out/*.csv
+
+  merge_and_commit:
+    runs-on: ubuntu-latest
+    needs: [scrape]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Install deps for merge
+        run: pip install pandas
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: staging
+      - name: Merge CSVs
+        run: python scripts/merge_csv.py
+      - name: Commit merged CSV
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/articles.csv
+          git commit -m "Update merged articles CSV [skip ci]" || echo "No changes to commit"
+          git push
