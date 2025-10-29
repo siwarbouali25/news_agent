@@ -1,5 +1,5 @@
 # app.py
-import os, re, hashlib, shutil, pandas as pd
+import os, re, hashlib, shutil, json, pandas as pd
 import streamlit as st
 from urllib.parse import urlparse
 from typing import TypedDict, List, Dict, Any
@@ -99,6 +99,19 @@ def ollama_chat(prompt: str, max_tokens: int = 220, temperature: float = 0.3) ->
     r = requests.post(OLLAMA_URL, json=payload, timeout=120)
     r.raise_for_status()
     return r.json().get("message", {}).get("content", "").strip()
+def _parse_json_from_text(txt: str) -> Dict[str, Any]:
+    """
+    Grab the last JSON-looking object from model output and parse it.
+    """
+    m = re.search(r"\{[\s\S]*\}$", txt.strip())
+    if not m:
+        m = re.search(r"\{[\s\S]*?\}", txt, re.DOTALL)
+    if not m:
+        return {"bias_decision": "Unclear", "decision_reasoning": "Model returned no JSON."}
+    try:
+        return json.loads(m.group())
+    except Exception as e:
+        return {"bias_decision": "Unclear", "decision_reasoning": f"JSON parse error: {e}"}
 
 def item_keybase(item: Dict[str, Any]) -> str:
     if item.get("id"):  # prefer stable id
@@ -227,6 +240,169 @@ def factcheck_scaffold(item: Dict[str, Any]) -> str:
         f"TITLE: {item.get('title','(Untitled)')}\n\nARTICLE:\n{content[:6000]}"
     )
     return ollama_chat(prompt, max_tokens=260, temperature=0.2)
+# =========================
+# FACT-CHECK → BIAS DECISION
+# =========================
+def factcheck_bias_decision(item: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Returns {"bias_decision": "Biased"/"Not Biased"/"Unclear",
+             "decision_reasoning": "..."}
+    """
+    content = get_article_text(item)
+    if not content.strip():
+        return {
+            "bias_decision": "Unclear",
+            "decision_reasoning": "No full text available to analyze."
+        }
+
+    prompt = f"""
+You are a professional news-bias checker.
+Read the article and output ONLY valid JSON with EXACTLY these keys:
+
+{{
+  "bias_decision": "Biased" or "Not Biased" or "Unclear",
+  "decision_reasoning": "brief justification (≤60 words)"
+}}
+
+Heuristics:
+- "Biased" → political stance explicit (not Center/Unknown) OR
+  manipulative/sensational tone OR credibility appears low.
+- "Not Biased" → neutral tone + supported claims + no manipulative framing.
+- "Unclear" → insufficient information to judge.
+
+ARTICLE:
+\"\"\"{content[:8000]}\"\"\"
+"""
+
+    raw = ollama_chat(prompt, max_tokens=220, temperature=0.2)
+    parsed = _parse_json_from_text(raw)
+
+    # --- Normalize possible model variants ---
+    val = (parsed.get("bias_decision") or "").strip().lower()
+    if val == "biased":
+        parsed["bias_decision"] = "Biased"
+    elif val in ("not biased", "unbiased", "not-biased"):
+        parsed["bias_decision"] = "Not Biased"
+    else:
+        parsed["bias_decision"] = "Unclear"
+
+    if not parsed.get("decision_reasoning"):
+        parsed["decision_reasoning"] = "No reasoning provided by the model."
+
+    return {
+        "bias_decision": parsed["bias_decision"],
+        "decision_reasoning": parsed["decision_reasoning"],
+    }
+
+# =========================
+# SOURCE RELIABILITY (CSV lookup)
+# =========================
+@st.cache_resource
+def _load_source_reliability():
+    import os
+    import pandas as pd
+
+    # Try common paths; fall back to project root upload
+    candidate_paths = [
+        "data/source_reliability_scores.csv",
+        "configs/source_reliability_scores.csv",
+        "source_reliability_scores.csv",
+        "/mnt/data/source_reliability_scores.csv",  # uploaded during dev
+    ]
+    for p in candidate_paths:
+        if os.path.exists(p):
+            df = pd.read_csv(p)
+            break
+    else:
+        # If not found, return an empty table (we’ll default to Mixed)
+        df = pd.DataFrame(columns=["domain", "score", "label"])
+
+    def _norm(s: str) -> str:
+        s = (s or "").lower().strip()
+        s = s.replace("the ", " ")  # soften "the guardian" vs "guardian"
+        # keep only letters/numbers/spaces
+        s = re.sub(r"[^a-z0-9 ]+", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    if "domain" in df.columns:
+        df["norm"] = df["domain"].astype(str).map(_norm)
+    else:
+        df["norm"] = ""
+    return df, _norm
+
+SOURCE_DF, _NORM_SOURCE = _load_source_reliability()
+
+def _source_name_from_item(item: Dict[str, Any]) -> str:
+    # 1) Prefer structured fields already in your items
+    name = item.get("source") or item.get("source_norm")
+    if name:
+        return str(name)
+
+    # 2) Derive from URL if present
+    url = item.get("url", "")
+    if url:
+        host = urlparse(url).hostname or ""
+        # e.g. "www.nytimes.com" -> "nytimes"
+        if host:
+            parts = host.split(".")
+            core = parts[-2] if len(parts) >= 2 else host
+            return core
+    return "(unknown)"
+
+def lookup_source_reliability(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Returns a dict:
+      {
+        "source_name": "...",
+        "source_reliability": "Reliable" | "Mixed" | "Not Reliable",
+        "source_label": original_label_from_csv_or_Unknown,
+        "source_score": float_or_None
+      }
+    """
+    name = _source_name_from_item(item)
+    n = _NORM_SOURCE(name)
+    df = SOURCE_DF
+
+    # fuzzy-ish match: "contains" either way on normalized text
+    if not df.empty:
+        cand = df[df["norm"].apply(lambda x: x in n or n in x)]
+        if len(cand) == 0:
+            # try token overlap
+            ntoks = set(n.split())
+            cand = df[df["norm"].apply(lambda x: len(ntoks & set(x.split())) >= 1)]
+
+        if len(cand) > 0:
+            row = cand.iloc[0]
+            label = str(row.get("label", "Unknown"))
+            score = row.get("score", None)
+
+            # Map to the 3-way decision your UI wants
+            if label == "Reliable":
+                decision = "Reliable"
+            elif label in ("Mixed", "Mostly reliable"):
+                decision = "Mixed"
+            else:
+                # fallback heuristic using score if present
+                try:
+                    decision = "Not Reliable" if float(score) < 0.5 else "Mixed"
+                except Exception:
+                    decision = "Mixed"
+
+            return {
+                "source_name": name,
+                "source_reliability": decision,
+                "source_label": label,
+                "source_score": (float(score) if pd.notna(score) else None),
+            }
+
+    # not found → default to Mixed (neutral)
+    return {
+        "source_name": name,
+        "source_reliability": "Mixed",
+        "source_label": "Unknown",
+        "source_score": None,
+    }
 
 # =========================
 # RETRIEVER (FAISS)
@@ -465,7 +641,67 @@ if "pending_action" in st.session_state:
         st.markdown(f"<div class='result-box'>{summary}</div>", unsafe_allow_html=True)
 
     elif pa["type"] == "factcheck":
-        with st.spinner("Preparing fact-check checklist…"):
-            notes = factcheck_scaffold(aitem)
-        st.markdown("#### 🔎 Fact-check checklist (draft)")
-        st.markdown(f"<div class='result-box'>{notes}</div>", unsafe_allow_html=True)
+        with st.spinner("Analyzing source & bias…"):
+            # Source reliability (from CSV)
+            src = lookup_source_reliability(aitem)
+            # Bias decision (LLM)
+            out = factcheck_bias_decision(aitem)
+
+        # --- verdict colors ---
+        def _color_for(val: str) -> str:
+            val = (val or "").strip().lower()
+            if val in ("reliable", "not biased"):
+                return "#2ecc71"  # green
+            if val in ("not reliable", "biased"):
+                return "#e74c3c"  # red
+            return "#f1c40f"      # yellow for mixed/unclear
+
+        # --- Header ---
+        st.markdown("#### 🔎 Fact-check")
+
+        # --- Source Reliability (single line, bold, simple) ---
+        s_name = src.get("source_name", "(unknown)")
+        s_verdict = src.get("source_reliability", "Mixed")
+        s_color = _color_for(s_verdict)
+        st.markdown(
+            f"""
+            <div style="
+                margin-top:0.3em;margin-bottom:0.6em;
+                font-size:1.05em;font-weight:600;
+            ">
+                Source (<span style="opacity:.85">{s_name}</span>):
+                <span style="color:{s_color}">{s_verdict}</span>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        # --- Bias Decision (single line, bold, simple) ---
+        b_verdict = out.get("bias_decision", "Unclear")
+        b_color = _color_for(b_verdict)
+        st.markdown(
+            f"""
+            <div style="
+                margin-top:0.2em;margin-bottom:0.8em;
+                font-size:1.05em;font-weight:600;
+            ">
+                Bias:
+                <span style="color:{b_color}">{b_verdict}</span>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        # --- Reasoning block (kept simple) ---
+        reason = out.get("decision_reasoning", "No reasoning provided.")
+        st.markdown(
+            f"""
+            <div style='
+                background:#1e1e1e; border-radius:10px;
+                padding:0.9em; line-height:1.55; color:#ddd; font-size:0.95em;
+            '>{reason}</div>
+            """,
+            unsafe_allow_html=True
+        )
+
+
