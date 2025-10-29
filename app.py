@@ -1,5 +1,5 @@
 # app.py
-import os, re, hashlib, shutil, pandas as pd
+import os, re, hashlib, shutil, json, pandas as pd
 import streamlit as st
 from urllib.parse import urlparse
 from typing import TypedDict, List, Dict, Any
@@ -99,6 +99,19 @@ def ollama_chat(prompt: str, max_tokens: int = 220, temperature: float = 0.3) ->
     r = requests.post(OLLAMA_URL, json=payload, timeout=120)
     r.raise_for_status()
     return r.json().get("message", {}).get("content", "").strip()
+def _parse_json_from_text(txt: str) -> Dict[str, Any]:
+    """
+    Grab the last JSON-looking object from model output and parse it.
+    """
+    m = re.search(r"\{[\s\S]*\}$", txt.strip())
+    if not m:
+        m = re.search(r"\{[\s\S]*?\}", txt, re.DOTALL)
+    if not m:
+        return {"bias_decision": "Unclear", "decision_reasoning": "Model returned no JSON."}
+    try:
+        return json.loads(m.group())
+    except Exception as e:
+        return {"bias_decision": "Unclear", "decision_reasoning": f"JSON parse error: {e}"}
 
 def item_keybase(item: Dict[str, Any]) -> str:
     if item.get("id"):  # prefer stable id
@@ -227,6 +240,59 @@ def factcheck_scaffold(item: Dict[str, Any]) -> str:
         f"TITLE: {item.get('title','(Untitled)')}\n\nARTICLE:\n{content[:6000]}"
     )
     return ollama_chat(prompt, max_tokens=260, temperature=0.2)
+# =========================
+# FACT-CHECK → BIAS DECISION
+# =========================
+def factcheck_bias_decision(item: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Returns {"bias_decision": "Biased"/"Not Biased"/"Unclear",
+             "decision_reasoning": "..."}
+    """
+    content = get_article_text(item)
+    if not content.strip():
+        return {
+            "bias_decision": "Unclear",
+            "decision_reasoning": "No full text available to analyze."
+        }
+
+    prompt = f"""
+You are a professional news-bias checker.
+Read the article and output ONLY valid JSON with EXACTLY these keys:
+
+{{
+  "bias_decision": "Biased" or "Not Biased" or "Unclear",
+  "decision_reasoning": "brief justification (≤60 words)"
+}}
+
+Heuristics:
+- "Biased" → political stance explicit (not Center/Unknown) OR
+  manipulative/sensational tone OR credibility appears low.
+- "Not Biased" → neutral tone + supported claims + no manipulative framing.
+- "Unclear" → insufficient information to judge.
+
+ARTICLE:
+\"\"\"{content[:8000]}\"\"\"
+"""
+
+    raw = ollama_chat(prompt, max_tokens=220, temperature=0.2)
+    parsed = _parse_json_from_text(raw)
+
+    # --- Normalize possible model variants ---
+    val = (parsed.get("bias_decision") or "").strip().lower()
+    if val == "biased":
+        parsed["bias_decision"] = "Biased"
+    elif val in ("not biased", "unbiased", "not-biased"):
+        parsed["bias_decision"] = "Not Biased"
+    else:
+        parsed["bias_decision"] = "Unclear"
+
+    if not parsed.get("decision_reasoning"):
+        parsed["decision_reasoning"] = "No reasoning provided by the model."
+
+    return {
+        "bias_decision": parsed["bias_decision"],
+        "decision_reasoning": parsed["decision_reasoning"],
+    }
 
 # =========================
 # RETRIEVER (FAISS)
@@ -465,7 +531,30 @@ if "pending_action" in st.session_state:
         st.markdown(f"<div class='result-box'>{summary}</div>", unsafe_allow_html=True)
 
     elif pa["type"] == "factcheck":
-        with st.spinner("Preparing fact-check checklist…"):
-            notes = factcheck_scaffold(aitem)
-        st.markdown("#### 🔎 Fact-check checklist (draft)")
-        st.markdown(f"<div class='result-box'>{notes}</div>", unsafe_allow_html=True)
+        with st.spinner("Analyzing bias…"):
+            out = factcheck_bias_decision(aitem)
+
+        st.markdown("#### 🔎 Fact-check — Bias Decision")
+
+        decision = out.get("bias_decision", "Unclear").strip()
+        st.markdown(
+            f"""
+            <div style='
+                font-size:1.3em;
+                font-weight:600;
+                color:#e74c3c;
+                margin:0.5em 0;
+            '>
+                🧭 Decision: {decision}
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+
+        st.markdown("**Reasoning**")
+        st.markdown(
+            f"<div class='result-box'>{out.get('decision_reasoning', 'No reasoning provided.')}</div>",
+            unsafe_allow_html=True
+        )
+
