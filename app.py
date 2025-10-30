@@ -76,7 +76,7 @@ hr{ border-color:var(--border)!important }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📰 News AI Agent — Local Llama 3 (Ollama)")
+st.title("📰 News AI Agent")
 
 # =========================
 # HELPERS
@@ -96,9 +96,10 @@ def ollama_chat(prompt: str, max_tokens: int = 220, temperature: float = 0.3) ->
         "stream": False,
         "options": {"num_predict": max_tokens, "temperature": temperature}
     }
-    r = requests.post(OLLAMA_URL, json=payload, timeout=120)
+    r = requests.post(OLLAMA_URL, json=payload, timeout=300)
     r.raise_for_status()
     return r.json().get("message", {}).get("content", "").strip()
+
 def _parse_json_from_text(txt: str) -> Dict[str, Any]:
     """
     Grab the last JSON-looking object from model output and parse it.
@@ -112,6 +113,87 @@ def _parse_json_from_text(txt: str) -> Dict[str, Any]:
         return json.loads(m.group())
     except Exception as e:
         return {"bias_decision": "Unclear", "decision_reasoning": f"JSON parse error: {e}"}
+
+# =========================
+# BIAS ANALYSIS
+# =========================
+class BiasState(TypedDict):
+    article: str
+    bias_json: Dict[str, Any] | None
+    decision_json: Dict[str, Any] | None
+
+def node_bias_analyze(state: BiasState) -> BiasState:
+    article = (state.get("article") or "").strip()
+    if not article:
+        return {"article": article, "bias_json": {"error": "empty article text"}, "decision_json": None}
+
+    prompt = f"""
+You are a media-analysis expert.
+Analyze the news article below and output ONLY valid JSON with these fields:
+
+- credibility_score: integer 0–100
+- political_bias: one of "Left", "Right", "Center", "Unknown"
+- emotional_tone: one of "Neutral", "Emotional", "Manipulative"
+- persuasive_techniques: short list of strings
+- bias_summary: 1–2 sentence summary
+- analysis_reasoning: 1–2 sentences
+
+Article:
+\"\"\"{article[:8000]}\"\"\"\n
+Return ONLY JSON like this:
+{{
+  "credibility_score": 0,
+  "political_bias": "Center",
+  "emotional_tone": "Neutral",
+  "persuasive_techniques": ["framing", "appeal to authority"],
+  "bias_summary": "...",
+  "analysis_reasoning": "..."
+}}
+"""
+    out = ollama_chat(prompt, max_tokens=380, temperature=0.2)
+    return {"article": article, "bias_json": _parse_json_from_text(out), "decision_json": None}
+
+def node_bias_decide(state: BiasState) -> BiasState:
+    bias = state.get("bias_json") or {}
+    prompt = f"""
+You will receive a JSON analysis of a news article.
+
+Decide whether the article is "Biased" or "Not Biased".
+
+Heuristics:
+- "Biased" if political_bias != "Center"/"Unknown", OR emotional_tone == "Manipulative", OR credibility_score < 50.
+- Otherwise "Not Biased".
+
+Return ONLY JSON:
+{{
+  "bias_decision": "Biased" or "Not Biased",
+  "decision_reasoning": "brief justification"
+}}
+
+Input:
+{json.dumps(bias, indent=2)}
+"""
+    out = ollama_chat(prompt, max_tokens=220, temperature=0.2)
+    return {"article": state.get("article",""), "bias_json": bias, "decision_json": _parse_json_from_text(out)}
+
+# --- Wrappers to run bias nodes inside the main graph ---
+def node_bias_analyze_main(state: dict) -> dict:
+    out = node_bias_analyze({
+        "article": state.get("article", ""),
+        "bias_json": state.get("bias_json"),
+        "decision_json": state.get("decision_json"),
+    })
+    state.update(out)
+    return state
+
+def node_bias_decide_main(state: dict) -> dict:
+    out = node_bias_decide({
+        "article": state.get("article", ""),
+        "bias_json": state.get("bias_json"),
+        "decision_json": state.get("decision_json"),
+    })
+    state.update(out)
+    return state
 
 def item_keybase(item: Dict[str, Any]) -> str:
     if item.get("id"):  # prefer stable id
@@ -170,7 +252,7 @@ ARTICLE_BY_ID: Dict[str, Dict[str, Any]] = {}
 ARTICLE_BY_URL: Dict[str, Dict[str, Any]] = {}
 
 # =========================
-# SUMMARIZER (FLAN-T5)
+# SUMMARIZER (FLAN-T5) — used for summaries
 # =========================
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline as hf_pipeline
 import torch
@@ -210,89 +292,20 @@ def summarize_text_long(text: str) -> str:
     )[0]["generated_text"].strip()
     return final
 
-def get_article_text(item: Dict[str, Any]) -> str:
-    aid = (item.get("id") or "").strip()
+def get_article_text_by_id(aid: str) -> str:
     if aid and aid in ARTICLE_BY_ID:
         return ARTICLE_BY_ID[aid].get("content","") or ""
-    url = (item.get("url") or "").strip()
-    if url and url in ARTICLE_BY_URL:
-        return ARTICLE_BY_URL[url].get("content","") or ""
     return ""
 
-def summarize_article(item: Dict[str, Any]) -> str:
-    content = get_article_text(item)
+def summarize_by_id(aid: str, title: str) -> str:
+    content = get_article_text_by_id(aid)
     if not content:
         return "_No full text available in dataset to summarize._"
     try:
         summary = summarize_text_long(content)
-        return f"**{item.get('title','(Untitled)')}**\n\n{summary}"
+        return f"**{title or '(Untitled)'}**\n\n{summary}"
     except Exception as e:
         return f"_Summary failed: {e}_"
-
-def factcheck_scaffold(item: Dict[str, Any]) -> str:
-    content = get_article_text(item)
-    if not content:
-        return "_No full text available; cannot extract claims for checking._"
-    prompt = (
-        "From the article below, extract up to 3 checkable claims as short bullet points. "
-        "For each claim, add one line 'How to verify:' with suggested authoritative sources "
-        "(official stats, press releases, reputable outlets). Do NOT invent verdicts.\n\n"
-        f"TITLE: {item.get('title','(Untitled)')}\n\nARTICLE:\n{content[:6000]}"
-    )
-    return ollama_chat(prompt, max_tokens=260, temperature=0.2)
-# =========================
-# FACT-CHECK → BIAS DECISION
-# =========================
-def factcheck_bias_decision(item: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Returns {"bias_decision": "Biased"/"Not Biased"/"Unclear",
-             "decision_reasoning": "..."}
-    """
-    content = get_article_text(item)
-    if not content.strip():
-        return {
-            "bias_decision": "Unclear",
-            "decision_reasoning": "No full text available to analyze."
-        }
-
-    prompt = f"""
-You are a professional news-bias checker.
-Read the article and output ONLY valid JSON with EXACTLY these keys:
-
-{{
-  "bias_decision": "Biased" or "Not Biased" or "Unclear",
-  "decision_reasoning": "brief justification (≤60 words)"
-}}
-
-Heuristics:
-- "Biased" → political stance explicit (not Center/Unknown) OR
-  manipulative/sensational tone OR credibility appears low.
-- "Not Biased" → neutral tone + supported claims + no manipulative framing.
-- "Unclear" → insufficient information to judge.
-
-ARTICLE:
-\"\"\"{content[:8000]}\"\"\"
-"""
-
-    raw = ollama_chat(prompt, max_tokens=220, temperature=0.2)
-    parsed = _parse_json_from_text(raw)
-
-    # --- Normalize possible model variants ---
-    val = (parsed.get("bias_decision") or "").strip().lower()
-    if val == "biased":
-        parsed["bias_decision"] = "Biased"
-    elif val in ("not biased", "unbiased", "not-biased"):
-        parsed["bias_decision"] = "Not Biased"
-    else:
-        parsed["bias_decision"] = "Unclear"
-
-    if not parsed.get("decision_reasoning"):
-        parsed["decision_reasoning"] = "No reasoning provided by the model."
-
-    return {
-        "bias_decision": parsed["bias_decision"],
-        "decision_reasoning": parsed["decision_reasoning"],
-    }
 
 # =========================
 # SOURCE RELIABILITY (CSV lookup)
@@ -302,25 +315,22 @@ def _load_source_reliability():
     import os
     import pandas as pd
 
-    # Try common paths; fall back to project root upload
     candidate_paths = [
         "data/source_reliability_scores.csv",
         "configs/source_reliability_scores.csv",
         "source_reliability_scores.csv",
-        "/mnt/data/source_reliability_scores.csv",  # uploaded during dev
+        "/mnt/data/source_reliability_scores.csv",
     ]
     for p in candidate_paths:
         if os.path.exists(p):
             df = pd.read_csv(p)
             break
     else:
-        # If not found, return an empty table (we’ll default to Mixed)
         df = pd.DataFrame(columns=["domain", "score", "label"])
 
     def _norm(s: str) -> str:
         s = (s or "").lower().strip()
-        s = s.replace("the ", " ")  # soften "the guardian" vs "guardian"
-        # keep only letters/numbers/spaces
+        s = s.replace("the ", " ")
         s = re.sub(r"[^a-z0-9 ]+", " ", s)
         s = re.sub(r"\s+", " ", s).strip()
         return s
@@ -334,16 +344,12 @@ def _load_source_reliability():
 SOURCE_DF, _NORM_SOURCE = _load_source_reliability()
 
 def _source_name_from_item(item: Dict[str, Any]) -> str:
-    # 1) Prefer structured fields already in your items
     name = item.get("source") or item.get("source_norm")
     if name:
         return str(name)
-
-    # 2) Derive from URL if present
     url = item.get("url", "")
     if url:
         host = urlparse(url).hostname or ""
-        # e.g. "www.nytimes.com" -> "nytimes"
         if host:
             parts = host.split(".")
             core = parts[-2] if len(parts) >= 2 else host
@@ -352,11 +358,11 @@ def _source_name_from_item(item: Dict[str, Any]) -> str:
 
 def lookup_source_reliability(item: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Returns a dict:
+    Returns:
       {
         "source_name": "...",
-        "source_reliability": "Reliable" | "Mixed" | "Not Reliable",
-        "source_label": original_label_from_csv_or_Unknown,
+        "source_reliability": "Reliable" | "Mostly Reliable" | "Mixed" | "Not Reliable",
+        "source_label": original_label,
         "source_score": float_or_None
       }
     """
@@ -364,11 +370,9 @@ def lookup_source_reliability(item: Dict[str, Any]) -> Dict[str, Any]:
     n = _NORM_SOURCE(name)
     df = SOURCE_DF
 
-    # fuzzy-ish match: "contains" either way on normalized text
     if not df.empty:
         cand = df[df["norm"].apply(lambda x: x in n or n in x)]
         if len(cand) == 0:
-            # try token overlap
             ntoks = set(n.split())
             cand = df[df["norm"].apply(lambda x: len(ntoks & set(x.split())) >= 1)]
 
@@ -377,17 +381,23 @@ def lookup_source_reliability(item: Dict[str, Any]) -> Dict[str, Any]:
             label = str(row.get("label", "Unknown"))
             score = row.get("score", None)
 
-            # Map to the 3-way decision your UI wants
-            if label == "Reliable":
+            label_clean = str(label).strip().title()
+            if label_clean == "Reliable":
                 decision = "Reliable"
-            elif label in ("Mixed", "Mostly reliable"):
+            elif label_clean in ("Mostly Reliable", "Mostly-Reliable"):
+                decision = "Mostly Reliable"
+            elif label_clean == "Mixed":
                 decision = "Mixed"
             else:
-                # fallback heuristic using score if present
                 try:
-                    decision = "Not Reliable" if float(score) < 0.5 else "Mixed"
+                    if float(score) < 0.5:
+                        decision = "Not Reliable"
+                    elif float(score) < 0.7:
+                        decision = "Mostly Reliable"
+                    else:
+                        decision = "Reliable"
                 except Exception:
-                    decision = "Mixed"
+                    decision = label_clean or "Mixed"
 
             return {
                 "source_name": name,
@@ -396,7 +406,6 @@ def lookup_source_reliability(item: Dict[str, Any]) -> Dict[str, Any]:
                 "source_score": (float(score) if pd.notna(score) else None),
             }
 
-    # not found → default to Mixed (neutral)
     return {
         "source_name": name,
         "source_reliability": "Mixed",
@@ -409,18 +418,15 @@ def lookup_source_reliability(item: Dict[str, Any]) -> Dict[str, Any]:
 # =========================
 @st.cache_resource
 def load_retriever():
-    # build df
     if not os.path.exists(CSV_PATH):
         st.error(f"CSV not found at {CSV_PATH}. Set NEWS_CSV or put articles.csv beside app.py.")
         st.stop()
     df = pd.read_csv(CSV_PATH).fillna("")
 
-    # ensure base columns
     for col in ["title","content","url","source",DATE_COL,"category",AID_COL]:
         if col not in df.columns:
             df[col] = ""
 
-    # id normalize (fallback if blank)
     def _ensure_id(val, row):
         s = str(val).strip()
         if s and s.lower() not in ("nan","none","null"):
@@ -429,7 +435,6 @@ def load_retriever():
         return hashlib.md5(base.encode("utf-8")).hexdigest()
     df[AID_COL] = df.apply(lambda r: _ensure_id(r.get(AID_COL, ""), r), axis=1)
 
-    # source normalize
     def _canon(row):
         s = (row.get("source") or "").strip()
         if s: return s
@@ -440,7 +445,6 @@ def load_retriever():
         except: return "unknown"
     df["source_norm"] = df.apply(_canon, axis=1)
 
-    # fast lookups
     article_by_id = {
         str(row[AID_COL]): {
             "id": str(row[AID_COL]),
@@ -459,7 +463,6 @@ def load_retriever():
         for _, row in df.iterrows() if str(row.get("url","")).strip()
     }
 
-    # FAISS docs (include id)
     docs = []
     for _, row in df.iterrows():
         meta = {k: str(row[k]) for k in df.columns if k != "content"}
@@ -474,7 +477,6 @@ def load_retriever():
         vs = FAISS.from_documents(docs, emb)
         vs.save_local(INDEX_DIR)
 
-    # return everything you need on each run
     return vs.as_retriever(search_kwargs={"k": 12}), article_by_id, article_by_url
 
 retriever, ARTICLE_BY_ID, ARTICLE_BY_URL = load_retriever()
@@ -483,11 +485,19 @@ retriever, ARTICLE_BY_ID, ARTICLE_BY_URL = load_retriever()
 # AGENT (LangGraph)
 # =========================
 class State(TypedDict):
+    # core
     query: str
     k: int
     mode: str
     results: List[Dict[str, Any]] | List[Document]
     answer: str
+    # actions
+    action: str            # "", "summarize", "factcheck"
+    aid: str               # article id for summarize
+    article: str           # article text for factcheck path
+    bias_json: Dict[str, Any] | None
+    decision_json: Dict[str, Any] | None
+    summary: str
 
 def format_hits(hits: List[Document], k: int) -> List[Dict[str, Any]]:
     out, seen = [], set()
@@ -508,7 +518,6 @@ def format_hits(hits: List[Document], k: int) -> List[Dict[str, Any]]:
         if len(out) >= k: break
     return out
 
-# compatibility shim for retriever API
 def _retrieve(query: str):
     try:
         return retriever.get_relevant_documents(query)
@@ -516,10 +525,20 @@ def _retrieve(query: str):
         return retriever.invoke(query)
 
 def route(state: State) -> str:
-    q = (state["query"] or "").lower().strip()
+    # ---- check UI-triggered actions first ----
+    act = (state.get("action") or "").lower().strip()
+    if act == "factcheck":
+        return "bias_analyze"
+    if act == "summarize":
+        return "summarize"
+
+    # ---- default question vs. category routing ----
+    q = (state.get("query") or "").lower().strip()
     if q.endswith("?") or re.match(r"^(what|who|why|how|when|where)\b", q):
-        state["mode"] = "qa"; return "qa"
-    state["mode"] = "list"; return "list"
+        state["mode"] = "qa"
+        return "retrieve_qa"
+    state["mode"] = "list"
+    return "retrieve_list"
 
 def router_node(state: State) -> State:
     route(state); return state
@@ -559,17 +578,47 @@ def node_llm_answer(state: State) -> State:
     state["answer"] = ollama_chat(prompt, max_tokens=220, temperature=0.3)
     return state
 
+def node_summarize(state: State) -> State:
+    aid = (state.get("aid") or "").strip()
+    title = ARTICLE_BY_ID.get(aid, {}).get("title", "")
+    state["summary"] = summarize_by_id(aid, title)
+    return state
+
 # Build graph
 g = StateGraph(State)
 g.add_node("router", router_node)
 g.set_entry_point("router")
-g.add_conditional_edges("router", route, {"list": "retrieve_list", "qa": "retrieve_qa"})
+
+# retrieval branches
 g.add_node("retrieve_list", node_retrieve_list)
 g.add_node("retrieve_qa", node_retrieve_qa)
 g.add_node("llm_answer", node_llm_answer)
+
+# bias path inside main graph
+g.add_node("bias_analyze", node_bias_analyze_main)
+g.add_node("bias_decide", node_bias_decide_main)
+
+# action branch
+g.add_node("summarize", node_summarize)
+g.add_edge("summarize", END)
+
+# routing
+g.add_conditional_edges("router", route, {
+    "retrieve_list": "retrieve_list",
+    "retrieve_qa": "retrieve_qa",
+    "bias_analyze": "bias_analyze",
+    "summarize": "summarize",
+})
+
+# edges
 g.add_edge("retrieve_list", END)
 g.add_edge("retrieve_qa", "llm_answer")
 g.add_edge("llm_answer", END)
+
+# bias edges
+g.add_edge("bias_analyze", "bias_decide")
+g.add_edge("bias_decide", END)
+
 graph = g.compile()
 
 # =========================
@@ -584,7 +633,8 @@ with st.sidebar:
 if st.sidebar.button("Get Top Articles"):
     by_cat = {}
     for cat in selected_categories:
-        out = graph.invoke({"query": cat, "k": k, "mode": "", "results": [], "answer": ""})
+        out = graph.invoke({"query": cat, "k": k, "mode": "", "results": [], "answer": "",
+                            "action": "", "aid": "", "article": "", "bias_json": None, "decision_json": None, "summary": ""})
         by_cat[cat] = out.get("results", [])
     st.session_state["articles_by_cat"] = by_cat
 
@@ -611,7 +661,8 @@ user_q = st.text_input("Your question about the news:")
 
 if user_q:
     with st.spinner("Thinking..."):
-        resp = graph.invoke({"query": user_q, "k": k, "mode": "", "results": [], "answer": ""})
+        resp = graph.invoke({"query": user_q, "k": k, "mode": "", "results": [], "answer": "",
+                             "action": "", "aid": "", "article": "", "bias_json": None, "decision_json": None, "summary": ""})
 
     st.markdown("### 🧠 Answer")
     st.write(resp.get("answer", "No answer generated."))
@@ -629,79 +680,87 @@ if user_q:
             with cols[i % 3]:
                 render_card_with_actions(it, keybase=item_keybase(it))
 
-# ===== Handle card actions (summary / fact-check) =====
+# ===== Handle card actions (summary / fact-check) via GRAPH =====
 if "pending_action" in st.session_state:
     pa = st.session_state.pop("pending_action")
     aitem = pa["item"]
+    act_type = pa["type"]
 
-    if pa["type"] == "summarize":
+    # --------------------
+    # SUMMARIZATION via graph
+    # --------------------
+    if act_type == "summarize":
+        aid = aitem.get("id", "")
         with st.spinner("Summarizing…"):
-            summary = summarize_article(aitem)
+            out = graph.invoke({
+                "query": "",
+                "k": 0,
+                "mode": "",
+                "results": [],
+                "answer": "",
+                "action": "summarize",
+                "aid": aid,
+                "article": "",
+                "bias_json": None,
+                "decision_json": None,
+                "summary": ""
+            })
+        summary = out.get("summary", "_No summary generated._")
         st.markdown("#### 📝 Summary")
         st.markdown(f"<div class='result-box'>{summary}</div>", unsafe_allow_html=True)
 
-    elif pa["type"] == "factcheck":
+    # --------------------
+    # FACT-CHECK via graph
+    # --------------------
+    elif act_type == "factcheck":
         with st.spinner("Analyzing source & bias…"):
-            # Source reliability (from CSV)
             src = lookup_source_reliability(aitem)
-            # Bias decision (LLM)
-            out = factcheck_bias_decision(aitem)
+            atext = ARTICLE_BY_ID.get(aitem.get("id", ""), {}).get("content", "")
 
-        # --- verdict colors ---
+            if not atext.strip():
+                decision_json = {"bias_decision": "Unclear", "decision_reasoning": "No full text available."}
+            else:
+                bout = graph.invoke({
+                    "query": "",
+                    "k": 0,
+                    "mode": "",
+                    "results": [],
+                    "answer": "",
+                    "action": "factcheck",
+                    "aid": "",
+                    "article": atext,
+                    "bias_json": None,
+                    "decision_json": None,
+                    "summary": ""
+                })
+                decision_json = bout.get("decision_json") or {
+                    "bias_decision": "Unclear",
+                    "decision_reasoning": "No output."
+                }
+
         def _color_for(val: str) -> str:
-            val = (val or "").strip().lower()
-            if val in ("reliable", "not biased"):
-                return "#2ecc71"  # green
-            if val in ("not reliable", "biased"):
-                return "#e74c3c"  # red
-            return "#f1c40f"      # yellow for mixed/unclear
+            v = (val or "").strip().lower()
+            if v in ("mostly reliable", "reliable", "not biased"):
+                return "#2ecc71"
+            if v in ("not reliable", "biased"):
+                return "#e74c3c"
+            return "#f1c40f"
 
-        # --- Header ---
         st.markdown("#### 🔎 Fact-check")
-
-        # --- Source Reliability (single line, bold, simple) ---
         s_name = src.get("source_name", "(unknown)")
         s_verdict = src.get("source_reliability", "Mixed")
-        s_color = _color_for(s_verdict)
         st.markdown(
-            f"""
-            <div style="
-                margin-top:0.3em;margin-bottom:0.6em;
-                font-size:1.05em;font-weight:600;
-            ">
-                Source (<span style="opacity:.85">{s_name}</span>):
-                <span style="color:{s_color}">{s_verdict}</span>
-            </div>
-            """,
+            f"<div style='font-weight:600;margin:.3em 0'>Source (<span style='opacity:.85'>{s_name}</span>): "
+            f"<span style='color:{_color_for(s_verdict)}'>{s_verdict}</span></div>",
             unsafe_allow_html=True
         )
 
-        # --- Bias Decision (single line, bold, simple) ---
-        b_verdict = out.get("bias_decision", "Unclear")
-        b_color = _color_for(b_verdict)
+        decision = decision_json.get("bias_decision", "Unclear")
         st.markdown(
-            f"""
-            <div style="
-                margin-top:0.2em;margin-bottom:0.8em;
-                font-size:1.05em;font-weight:600;
-            ">
-                Bias:
-                <span style="color:{b_color}">{b_verdict}</span>
-            </div>
-            """,
+            f"<div style='font-weight:600;margin:.2em 0 .8em 0'>Bias: "
+            f"<span style='color:{_color_for(decision)}'>{decision}</span></div>",
             unsafe_allow_html=True
         )
 
-        # --- Reasoning block (kept simple) ---
-        reason = out.get("decision_reasoning", "No reasoning provided.")
-        st.markdown(
-            f"""
-            <div style='
-                background:#1e1e1e; border-radius:10px;
-                padding:0.9em; line-height:1.55; color:#ddd; font-size:0.95em;
-            '>{reason}</div>
-            """,
-            unsafe_allow_html=True
-        )
-
-
+        reason = decision_json.get("decision_reasoning", "No reasoning provided.")
+        st.markdown(f"<div class='result-box'>{reason}</div>", unsafe_allow_html=True)

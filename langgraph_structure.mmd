@@ -1,0 +1,28 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__(<p>__start__</p>)
+	router(router)
+	summarize(summarize)
+	bias_analyze(bias_analyze)
+	bias_decide(bias_decide)
+	retrieve_list(retrieve_list)
+	retrieve_qa(retrieve_qa)
+	llm_answer(llm_answer)
+	__end__(<p>__end__</p>)
+	__start__ --> router;
+	retrieve_qa --> llm_answer;
+	router -.-> bias_analyze;
+	router -. &nbsp;list&nbsp; .-> retrieve_list;
+	router -. &nbsp;qa&nbsp; .-> retrieve_qa;
+	router -.-> summarize;
+	bias_analyze --> __end__;
+	llm_answer --> __end__;
+	retrieve_list --> __end__;
+	summarize --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
