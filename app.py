@@ -14,7 +14,7 @@ from langchain_core.documents import Document
 # =========================
 # CONFIG
 # =========================
-CSV_PATH   = os.environ.get("NEWS_CSV", "articles.csv")   # your CSV path
+CSV_PATH   = os.environ.get("NEWS_CSV", "data/Articles.csv")   # your CSV path
 INDEX_DIR  = os.environ.get("INDEX_DIR", "faiss_news_index")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
@@ -81,6 +81,21 @@ st.title("📰 News AI Agent")
 # =========================
 # HELPERS
 # =========================
+import hashlib, os, json, time
+
+def file_signature(path: str) -> dict:
+    """Stable signature of a file: mtime, size, sha1."""
+    if not os.path.exists(path):
+        return {"exists": False}
+    with open(path, "rb") as f:
+        data = f.read()
+    return {
+        "exists": True,
+        "mtime": os.path.getmtime(path),
+        "size": len(data),
+        "sha1": hashlib.sha1(data).hexdigest(),
+    }
+
 def pretty_date(date_str):
     if not date_str or str(date_str) in ("nan","NaT"): return "Unknown date"
     try:
@@ -416,13 +431,57 @@ def lookup_source_reliability(item: Dict[str, Any]) -> Dict[str, Any]:
 # =========================
 # RETRIEVER (FAISS)
 # =========================
-@st.cache_resource
-def load_retriever():
+# --- NEW: CSV change detection helpers ---
+# =========================================================
+# CSV change detection helpers (keep as you have)
+# =========================================================
+INDEX_META = os.path.join(INDEX_DIR, "meta.json")
+
+def _file_signature(path: str) -> dict:
+    if not os.path.exists(path):
+        return {"exists": False}
+    import hashlib
+    with open(path, "rb") as f:
+        data = f.read()
+    return {
+        "exists": True,
+        "mtime": os.path.getmtime(path),
+        "size": len(data),
+        "sha1": hashlib.sha1(data).hexdigest(),
+    }
+
+def _load_saved_sig() -> dict:
+    try:
+        with open(INDEX_META, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_sig(sig: dict):
+    os.makedirs(INDEX_DIR, exist_ok=True)
+    with open(INDEX_META, "w", encoding="utf-8") as f:
+        json.dump(sig, f, indent=2)
+
+# Compare signatures and clear cache if changed (DO OUTSIDE CACHED FN)
+CSV_SIG   = _file_signature(CSV_PATH)
+SAVED_SIG = _load_saved_sig()
+if (not SAVED_SIG) or \
+   (SAVED_SIG.get("csv_sha1") != CSV_SIG.get("sha1")) or \
+   (SAVED_SIG.get("size") != CSV_SIG.get("size")):
+    st.cache_resource.clear()
+
+# =========================================================
+# 1) PURE CACHED CORE  (NO st.* CALLS HERE)
+# =========================================================
+@st.cache_resource(show_spinner=False)
+def _build_or_load_retriever(csv_sig: dict):
     if not os.path.exists(CSV_PATH):
-        st.error(f"CSV not found at {CSV_PATH}. Set NEWS_CSV or put articles.csv beside app.py.")
-        st.stop()
+        # no Streamlit UI calls here; raise and let the wrapper handle it
+        raise FileNotFoundError(CSV_PATH)
+
     df = pd.read_csv(CSV_PATH).fillna("")
 
+    # your existing normalization logic
     for col in ["title","content","url","source",DATE_COL,"category",AID_COL]:
         if col not in df.columns:
             df[col] = ""
@@ -442,7 +501,8 @@ def load_retriever():
         try:
             host = urlparse(url).netloc.lower()
             return host[4:] if host.startswith("www.") else (host or "unknown")
-        except: return "unknown"
+        except:
+            return "unknown"
     df["source_norm"] = df.apply(_canon, axis=1)
 
     article_by_id = {
@@ -471,15 +531,56 @@ def load_retriever():
 
     emb = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
     os.makedirs(INDEX_DIR, exist_ok=True)
-    if os.path.exists(os.path.join(INDEX_DIR, "index.faiss")):
-        vs = FAISS.load_local(INDEX_DIR, emb, allow_dangerous_deserialization=True)
-    else:
+
+    index_path = os.path.join(INDEX_DIR, "index.faiss")
+    saved = _load_saved_sig()
+
+    need_rebuild = (
+        not saved or
+        saved.get("csv_sha1") != csv_sig.get("sha1") or
+        saved.get("size") != csv_sig.get("size") or
+        not os.path.exists(index_path)
+    )
+
+    rebuilt = False
+    if need_rebuild and csv_sig.get("exists"):
         vs = FAISS.from_documents(docs, emb)
         vs.save_local(INDEX_DIR)
+        _save_sig({
+            "csv_sha1": csv_sig.get("sha1"),
+            "size": csv_sig.get("size"),
+            "mtime": csv_sig.get("mtime"),
+            "saved_at": datetime.utcnow().isoformat() + "Z",
+        })
+        rebuilt = True
+    else:
+        vs = FAISS.load_local(INDEX_DIR, emb, allow_dangerous_deserialization=True)
 
-    return vs.as_retriever(search_kwargs={"k": 12}), article_by_id, article_by_url
+    return vs.as_retriever(search_kwargs={"k": 12}), article_by_id, article_by_url, rebuilt
 
-retriever, ARTICLE_BY_ID, ARTICLE_BY_URL = load_retriever()
+# =========================================================
+# 2) THIN WRAPPER (handles UI messages safely)
+# =========================================================
+def load_retriever(csv_sig: dict):
+    try:
+        ret, by_id, by_url, rebuilt = _build_or_load_retriever(csv_sig)
+    except FileNotFoundError:
+        st.error(f"CSV not found at {CSV_PATH}. Set NEWS_CSV or put Articles.csv beside app.py.")
+        st.stop()
+
+    # UI notifications are fine here (not cached)
+    if rebuilt:
+        st.toast("🔁 CSV changed — embeddings rebuilt.", icon="🔧")
+    # else:
+    #     st.toast("✅ Dataset up to date.", icon="✅")
+
+    return ret, by_id, by_url
+
+# =========================================================
+# 3) USE IT
+# =========================================================
+retriever, ARTICLE_BY_ID, ARTICLE_BY_URL = load_retriever(CSV_SIG)
+
 
 # =========================
 # AGENT (LangGraph)
