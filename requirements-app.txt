@@ -13,6 +13,8 @@ langchain-core
 sentence-transformers
 faiss-cpu
 requests
+pyttsx3
+pypiwin32
 
 
 

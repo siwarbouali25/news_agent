@@ -1,8 +1,9 @@
 # app.py
-import os, re, hashlib, shutil, json, pandas as pd
+import os, re, json, hashlib, shutil, pandas as pd
+from hashlib import sha256
 import streamlit as st
 from urllib.parse import urlparse
-from typing import TypedDict, List, Dict, Any
+from typing import TypedDict, List, Dict, Any, Optional
 from datetime import datetime
 import requests
 
@@ -10,20 +11,24 @@ from langgraph.graph import StateGraph, END
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
+from tts import synthesize_tts
 
 # =========================
 # CONFIG
 # =========================
-CSV_PATH   = os.environ.get("NEWS_CSV", "articles.csv")   # your CSV path
-INDEX_DIR  = os.environ.get("INDEX_DIR", "faiss_news_index")
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+CSV_PATH     = os.environ.get("NEWS_CSV", "articles.csv")
+INDEX_DIR    = os.environ.get("INDEX_DIR", "faiss_news_index")
+EMBED_MODEL  = os.environ.get("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+
+VOICE_CHOICE = os.environ.get("TTS_VOICE", "zira")  # e.g. "zira" or "david"
+TTS_RATE     = int(os.environ.get("TTS_RATE", "175"))
 
 # Ollama (Llama 3) local server
 OLLAMA_URL   = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/chat")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3:latest")
 
 DATE_COL = "published_date"
-AID_COL  = "id_article"  # your CSV id column
+AID_COL  = "id_article"
 ALL_CATEGORIES = ["Technology","World","Politics","Science","Health","Sports","Culture","Entertainment","Society"]
 
 # =========================
@@ -32,47 +37,32 @@ ALL_CATEGORIES = ["Technology","World","Politics","Science","Health","Sports","C
 st.set_page_config(page_title="News Agent (Local Llama3)", layout="wide")
 st.markdown("""
 <style>
-:root{
-  --bg:#0f1116; --bg-soft:#151822; --text:#EDF2F7; --muted:#8b91a1; --brand:#35c2c1; --border:#262b36;
-  --card-grad1:#151a27; --card-grad2:#121723; --btn:#1e232e; --btn-hover:#242a37;
-}
+:root{ --bg:#0f1116; --bg-soft:#151822; --text:#EDF2F7; --muted:#8b91a1; --brand:#35c2c1; --border:#262b36;
+--card-grad1:#151a27; --card-grad2:#121723; --btn:#1e232e; --btn-hover:#242a37;}
 html, body, [data-testid="stAppViewContainer"]{ background:var(--bg); color:var(--text); }
 [data-testid="stSidebar"]{ background:var(--bg-soft)!important; }
 h1,h2,h3{ color:var(--text) }
 a, a:visited{ color:var(--brand); text-decoration:none; }
 
-.card-wrap{
-  border:1px solid var(--border);
-  background:linear-gradient(180deg,var(--card-grad1),var(--card-grad2));
-  border-radius:18px; padding:16px; height:100%;
-  box-shadow:0 0 0 1px rgba(53,194,193,.06), 0 10px 24px rgba(0,0,0,.35);
-  transition: transform .12s ease, box-shadow .12s ease;
-}
-.card-wrap:hover{
-  transform: translateY(-1px);
-  box-shadow:0 0 0 1px rgba(53,194,193,.1), 0 14px 28px rgba(0,0,0,.40);
-}
+.card-wrap{ border:1px solid var(--border); background:linear-gradient(180deg,var(--card-grad1),var(--card-grad2));
+  border-radius:18px; padding:16px; height:100%; box-shadow:0 0 0 1px rgba(53,194,193,.06), 0 10px 24px rgba(0,0,0,.35);
+  transition: transform .12s ease, box-shadow .12s ease; }
+.card-wrap:hover{ transform: translateY(-1px); box-shadow:0 0 0 1px rgba(53,194,193,.1), 0 14px 28px rgba(0,0,0,.40); }
 .card-title{ font-weight:700;font-size:1.05rem;line-height:1.3;margin:0 0 6px;color:var(--text); }
 .card-meta{ color:var(--muted);font-size:.9rem;margin:0 0 12px; }
 .card-link{ display:inline-block;color:var(--brand);font-weight:600;margin-bottom:12px; }
 .card-link:hover{ text-decoration:underline; }
 
 .card-actions { display:flex; gap:8px; margin-top:12px; }
-button[kind="secondary"]{
-  background:var(--btn); border:1px solid var(--border); color:var(--text);
-  font-size:.85rem; padding:4px 8px; border-radius:10px; height:32px!important; width:100%;
-}
-button[kind="secondary"]:hover{
-  background:var(--btn-hover); border-color:var(--brand); color:var(--brand); transform:translateY(-1px);
-}
+button[kind="secondary"]{ background:var(--btn); border:1px solid var(--border); color:var(--text);
+  font-size:.85rem; padding:4px 8px; border-radius:10px; height:32px!important; width:100%; }
+button[kind="secondary"]:hover{ background:var(--btn-hover); border-color:var(--brand); color:var(--brand); transform:translateY(-1px); }
 
 .section{ margin: 8px 0 22px; font-weight:800; font-size:1.25rem; letter-spacing:.2px; }
 .section .tag{ color:var(--muted); font-weight:600; font-size:1rem; margin-left:.25rem; }
 hr{ border-color:var(--border)!important }
-.result-box{
-  border:1px solid var(--border); background:linear-gradient(180deg,#151a27,#121723);
-  border-radius:14px; padding:14px; margin:10px 0;
-}
+.result-box{ border:1px solid var(--border); background:linear-gradient(180deg,#151a27,#121723);
+  border-radius:14px; padding:14px; margin:10px 0; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -101,9 +91,6 @@ def ollama_chat(prompt: str, max_tokens: int = 220, temperature: float = 0.3) ->
     return r.json().get("message", {}).get("content", "").strip()
 
 def _parse_json_from_text(txt: str) -> Dict[str, Any]:
-    """
-    Grab the last JSON-looking object from model output and parse it.
-    """
     m = re.search(r"\{[\s\S]*\}$", txt.strip())
     if not m:
         m = re.search(r"\{[\s\S]*?\}", txt, re.DOTALL)
@@ -126,11 +113,9 @@ def node_bias_analyze(state: BiasState) -> BiasState:
     article = (state.get("article") or "").strip()
     if not article:
         return {"article": article, "bias_json": {"error": "empty article text"}, "decision_json": None}
-
     prompt = f"""
 You are a media-analysis expert.
 Analyze the news article below and output ONLY valid JSON with these fields:
-
 - credibility_score: integer 0–100
 - political_bias: one of "Left", "Right", "Center", "Unknown"
 - emotional_tone: one of "Neutral", "Emotional", "Manipulative"
@@ -140,15 +125,10 @@ Analyze the news article below and output ONLY valid JSON with these fields:
 
 Article:
 \"\"\"{article[:8000]}\"\"\"\n
-Return ONLY JSON like this:
-{{
-  "credibility_score": 0,
-  "political_bias": "Center",
-  "emotional_tone": "Neutral",
-  "persuasive_techniques": ["framing", "appeal to authority"],
-  "bias_summary": "...",
-  "analysis_reasoning": "..."
-}}
+
+Return ONLY JSON like:
+{{"credibility_score": 0, "political_bias": "Center", "emotional_tone": "Neutral",
+ "persuasive_techniques": ["framing"], "bias_summary": "...", "analysis_reasoning": "..." }}
 """
     out = ollama_chat(prompt, max_tokens=380, temperature=0.2)
     return {"article": article, "bias_json": _parse_json_from_text(out), "decision_json": None}
@@ -156,19 +136,13 @@ Return ONLY JSON like this:
 def node_bias_decide(state: BiasState) -> BiasState:
     bias = state.get("bias_json") or {}
     prompt = f"""
-You will receive a JSON analysis of a news article.
-
 Decide whether the article is "Biased" or "Not Biased".
-
 Heuristics:
 - "Biased" if political_bias != "Center"/"Unknown", OR emotional_tone == "Manipulative", OR credibility_score < 50.
-- Otherwise "Not Biased".
+- Else "Not Biased".
 
 Return ONLY JSON:
-{{
-  "bias_decision": "Biased" or "Not Biased",
-  "decision_reasoning": "brief justification"
-}}
+{{ "bias_decision": "Biased" or "Not Biased", "decision_reasoning": "brief justification" }}
 
 Input:
 {json.dumps(bias, indent=2)}
@@ -176,15 +150,14 @@ Input:
     out = ollama_chat(prompt, max_tokens=220, temperature=0.2)
     return {"article": state.get("article",""), "bias_json": bias, "decision_json": _parse_json_from_text(out)}
 
-# --- Wrappers to run bias nodes inside the main graph ---
+# wrappers to use inside main graph
 def node_bias_analyze_main(state: dict) -> dict:
     out = node_bias_analyze({
         "article": state.get("article", ""),
         "bias_json": state.get("bias_json"),
         "decision_json": state.get("decision_json"),
     })
-    state.update(out)
-    return state
+    state.update(out); return state
 
 def node_bias_decide_main(state: dict) -> dict:
     out = node_bias_decide({
@@ -192,13 +165,12 @@ def node_bias_decide_main(state: dict) -> dict:
         "bias_json": state.get("bias_json"),
         "decision_json": state.get("decision_json"),
     })
-    state.update(out)
-    return state
+    state.update(out); return state
 
 def item_keybase(item: Dict[str, Any]) -> str:
-    if item.get("id"):  # prefer stable id
+    if item.get("id"):  # stable id
         return str(item["id"])[:10]
-    raw = (item.get("url") or item.get("title") or "") + (item.get("published_date") or "")
+    raw = (item.get("url") or item.get("title") or "") + (item.get(DATE_COL) or "")
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:10]
 
 def render_card_with_actions(item: Dict[str, Any], keybase: str):
@@ -208,9 +180,7 @@ def render_card_with_actions(item: Dict[str, Any], keybase: str):
     dt    = item.get(DATE_COL)
     aid   = item.get("id","")
 
-    # show whether content is present (based on lookup)
-    have_text = False
-    length = 0
+    have_text = False; length = 0
     if aid and aid in ARTICLE_BY_ID:
         txt = str(ARTICLE_BY_ID[aid].get("content","") or "")
         have_text, length = (len(txt) > 0), len(txt)
@@ -240,7 +210,7 @@ def render_card_with_actions(item: Dict[str, Any], keybase: str):
 def doc_to_item(d: Document) -> Dict[str, Any]:
     m = d.metadata or {}
     return {
-        "id": m.get("id", ""),  # carry id
+        "id": m.get("id", ""),
         "title": m.get("title", "") or "(Untitled)",
         "url":   m.get("url", "") or "",
         "source": m.get("source", "") or m.get("source_norm", "") or "Unknown source",
@@ -252,7 +222,7 @@ ARTICLE_BY_ID: Dict[str, Dict[str, Any]] = {}
 ARTICLE_BY_URL: Dict[str, Dict[str, Any]] = {}
 
 # =========================
-# SUMMARIZER (FLAN-T5) — used for summaries
+# SUMMARIZER (FLAN-T5)
 # =========================
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline as hf_pipeline
 import torch
@@ -268,27 +238,21 @@ def load_flan():
 flan = load_flan()
 
 def _sum_chunk(text: str, max_new_tokens: int = 180) -> str:
-    prompt = (
-        "Summarize the following news article in 3–5 concise bullet points, factual and neutral:\n\n"
-        f"{text}"
-    )
+    prompt = ("Summarize the following news article in 3–5 concise bullet points, factual and neutral:\n\n" + text)
     out = flan(prompt, max_new_tokens=max_new_tokens, temperature=0.0, do_sample=False)
     return out[0]["generated_text"].strip()
 
 def summarize_text_long(text: str) -> str:
     if not text: return ""
-    CHUNK = 1800  # chars
+    CHUNK = 1800
     chunks = [text[i:i+CHUNK] for i in range(0, len(text), CHUNK)]
     parts = [_sum_chunk(c, 160) for c in chunks]
     if len(parts) == 1:
         return parts[0]
     combined = "\n\n".join(parts)
     final = flan(
-        "Combine these bullet-point summaries into 5–7 bullets, removing redundancy and keeping key facts:\n\n"
-        + combined,
-        max_new_tokens=200,
-        temperature=0.0,
-        do_sample=False
+        "Combine these bullet-point summaries into 5–7 bullets, removing redundancy and keeping key facts:\n\n" + combined,
+        max_new_tokens=200, temperature=0.0, do_sample=False
     )[0]["generated_text"].strip()
     return final
 
@@ -312,9 +276,6 @@ def summarize_by_id(aid: str, title: str) -> str:
 # =========================
 @st.cache_resource
 def _load_source_reliability():
-    import os
-    import pandas as pd
-
     candidate_paths = [
         "data/source_reliability_scores.csv",
         "configs/source_reliability_scores.csv",
@@ -323,8 +284,7 @@ def _load_source_reliability():
     ]
     for p in candidate_paths:
         if os.path.exists(p):
-            df = pd.read_csv(p)
-            break
+            df = pd.read_csv(p); break
     else:
         df = pd.DataFrame(columns=["domain", "score", "label"])
 
@@ -345,8 +305,7 @@ SOURCE_DF, _NORM_SOURCE = _load_source_reliability()
 
 def _source_name_from_item(item: Dict[str, Any]) -> str:
     name = item.get("source") or item.get("source_norm")
-    if name:
-        return str(name)
+    if name: return str(name)
     url = item.get("url", "")
     if url:
         host = urlparse(url).hostname or ""
@@ -357,15 +316,6 @@ def _source_name_from_item(item: Dict[str, Any]) -> str:
     return "(unknown)"
 
 def lookup_source_reliability(item: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Returns:
-      {
-        "source_name": "...",
-        "source_reliability": "Reliable" | "Mostly Reliable" | "Mixed" | "Not Reliable",
-        "source_label": original_label,
-        "source_score": float_or_None
-      }
-    """
     name = _source_name_from_item(item)
     n = _NORM_SOURCE(name)
     df = SOURCE_DF
@@ -406,12 +356,7 @@ def lookup_source_reliability(item: Dict[str, Any]) -> Dict[str, Any]:
                 "source_score": (float(score) if pd.notna(score) else None),
             }
 
-    return {
-        "source_name": name,
-        "source_reliability": "Mixed",
-        "source_label": "Unknown",
-        "source_score": None,
-    }
+    return {"source_name": name, "source_reliability": "Mixed", "source_label": "Unknown", "source_score": None}
 
 # =========================
 # RETRIEVER (FAISS)
@@ -498,6 +443,9 @@ class State(TypedDict):
     bias_json: Dict[str, Any] | None
     decision_json: Dict[str, Any] | None
     summary: str
+    # TTS
+    audio: Optional[bytes]
+    audio_mime: Optional[str]
 
 def format_hits(hits: List[Document], k: int) -> List[Dict[str, Any]]:
     out, seen = [], set()
@@ -509,7 +457,7 @@ def format_hits(hits: List[Document], k: int) -> List[Dict[str, Any]]:
             continue
         seen.add(domain)
         out.append({
-            "id": meta.get("id", ""),  # carry id
+            "id": meta.get("id", ""),
             "title": meta.get("title", ""),
             "source": meta.get("source", "") or meta.get("source_norm", ""),
             "published_date": meta.get("published_date", ""),
@@ -525,20 +473,13 @@ def _retrieve(query: str):
         return retriever.invoke(query)
 
 def route(state: State) -> str:
-    # ---- check UI-triggered actions first ----
     act = (state.get("action") or "").lower().strip()
-    if act == "factcheck":
-        return "bias_analyze"
-    if act == "summarize":
-        return "summarize"
-
-    # ---- default question vs. category routing ----
+    if act == "factcheck": return "bias_analyze"
+    if act == "summarize": return "summarize"
     q = (state.get("query") or "").lower().strip()
     if q.endswith("?") or re.match(r"^(what|who|why|how|when|where)\b", q):
-        state["mode"] = "qa"
-        return "retrieve_qa"
-    state["mode"] = "list"
-    return "retrieve_list"
+        state["mode"] = "qa"; return "retrieve_qa"
+    state["mode"] = "list"; return "retrieve_list"
 
 def router_node(state: State) -> State:
     route(state); return state
@@ -566,14 +507,11 @@ def node_llm_answer(state: State) -> State:
         snippet = d.page_content[:max_chars]
         context.append(f"[{title}] {snippet}")
     ctx = "\n\n".join(context)
-
     prompt = (
         "You are a concise journalist assistant.\n"
         "Use ONLY the CONTEXT to answer the user's question. "
         "Cite article titles in parentheses when relevant.\n\n"
-        f"CONTEXT:\n{ctx}\n\n"
-        f"QUESTION: {state['query']}\n\n"
-        "ANSWER:"
+        f"CONTEXT:\n{ctx}\n\nQUESTION: {state['query']}\n\nANSWER:"
     )
     state["answer"] = ollama_chat(prompt, max_tokens=220, temperature=0.3)
     return state
@@ -582,6 +520,18 @@ def node_summarize(state: State) -> State:
     aid = (state.get("aid") or "").strip()
     title = ARTICLE_BY_ID.get(aid, {}).get("title", "")
     state["summary"] = summarize_by_id(aid, title)
+    return state
+
+# =========================
+# Text To Speech node
+# =========================
+def node_tts(state: State) -> State:
+    txt = (state.get("answer") or state.get("summary") or "").strip()
+    if not txt:
+        state["audio"], state["audio_mime"] = None, None
+        return state
+    audio, mime = synthesize_tts(txt, voice_substr=VOICE_CHOICE, rate=TTS_RATE)
+    state["audio"], state["audio_mime"] = audio, mime
     return state
 
 # Build graph
@@ -602,6 +552,12 @@ g.add_node("bias_decide", node_bias_decide_main)
 g.add_node("summarize", node_summarize)
 g.add_edge("summarize", END)
 
+# TTS
+g.add_node("tts", node_tts)
+g.add_edge("retrieve_qa", "llm_answer")
+g.add_edge("llm_answer", "tts")
+g.add_edge("tts", END)
+
 # routing
 g.add_conditional_edges("router", route, {
     "retrieve_list": "retrieve_list",
@@ -612,8 +568,6 @@ g.add_conditional_edges("router", route, {
 
 # edges
 g.add_edge("retrieve_list", END)
-g.add_edge("retrieve_qa", "llm_answer")
-g.add_edge("llm_answer", END)
 
 # bias edges
 g.add_edge("bias_analyze", "bias_decide")
@@ -645,8 +599,7 @@ if "articles_by_cat" in st.session_state:
             unsafe_allow_html=True,
         )
         if not items:
-            st.caption("No articles found.")
-            continue
+            st.caption("No articles found."); continue
         cols = st.columns(3)
         for i, it in enumerate(items):
             with cols[i % 3]:
@@ -667,83 +620,61 @@ if user_q:
     st.markdown("### 🧠 Answer")
     st.write(resp.get("answer", "No answer generated."))
 
+    # related
     results = resp.get("results", []) or []
     if results:
         if isinstance(results[0], Document):
             top_items = [doc_to_item(d) for d in results[:3]]
         else:
             top_items = results[:3]
-
         st.markdown("<div class='section'>📰 Related Articles <span class='tag'>(top 3)</span></div>", unsafe_allow_html=True)
         cols = st.columns(3)
         for i, it in enumerate(top_items):
             with cols[i % 3]:
                 render_card_with_actions(it, keybase=item_keybase(it))
 
-# ===== Handle card actions (summary / fact-check) via GRAPH =====
+    # audio
+    audio = resp.get("audio")
+    mime  = resp.get("audio_mime") or "audio/wav"
+    if audio:
+        st.markdown("### 🔊 Audio")
+        st.audio(audio, format=mime)
+        fname = "answer_" + sha256((resp.get("answer","")).encode("utf-8")).hexdigest()[:10] + (".wav" if "mpeg" not in mime else ".mp3")
+        st.download_button("Download audio", data=audio, file_name=fname, mime=mime, use_container_width=True)
+
+# ===== Handle card actions (summary / fact-check)
 if "pending_action" in st.session_state:
     pa = st.session_state.pop("pending_action")
-    aitem = pa["item"]
-    act_type = pa["type"]
+    aitem = pa["item"]; act_type = pa["type"]
 
-    # --------------------
-    # SUMMARIZATION via graph
-    # --------------------
     if act_type == "summarize":
         aid = aitem.get("id", "")
         with st.spinner("Summarizing…"):
             out = graph.invoke({
-                "query": "",
-                "k": 0,
-                "mode": "",
-                "results": [],
-                "answer": "",
-                "action": "summarize",
-                "aid": aid,
-                "article": "",
-                "bias_json": None,
-                "decision_json": None,
-                "summary": ""
+                "query": "", "k": 0, "mode": "", "results": [], "answer": "",
+                "action": "summarize", "aid": aid, "article": "", "bias_json": None, "decision_json": None, "summary": ""
             })
         summary = out.get("summary", "_No summary generated._")
         st.markdown("#### 📝 Summary")
         st.markdown(f"<div class='result-box'>{summary}</div>", unsafe_allow_html=True)
 
-    # --------------------
-    # FACT-CHECK via graph
-    # --------------------
     elif act_type == "factcheck":
         with st.spinner("Analyzing source & bias…"):
             src = lookup_source_reliability(aitem)
             atext = ARTICLE_BY_ID.get(aitem.get("id", ""), {}).get("content", "")
-
             if not atext.strip():
                 decision_json = {"bias_decision": "Unclear", "decision_reasoning": "No full text available."}
             else:
                 bout = graph.invoke({
-                    "query": "",
-                    "k": 0,
-                    "mode": "",
-                    "results": [],
-                    "answer": "",
-                    "action": "factcheck",
-                    "aid": "",
-                    "article": atext,
-                    "bias_json": None,
-                    "decision_json": None,
-                    "summary": ""
+                    "query": "", "k": 0, "mode": "", "results": [], "answer": "",
+                    "action": "factcheck", "aid": "", "article": atext, "bias_json": None, "decision_json": None, "summary": ""
                 })
-                decision_json = bout.get("decision_json") or {
-                    "bias_decision": "Unclear",
-                    "decision_reasoning": "No output."
-                }
+                decision_json = bout.get("decision_json") or {"bias_decision": "Unclear", "decision_reasoning": "No output."}
 
         def _color_for(val: str) -> str:
             v = (val or "").strip().lower()
-            if v in ("mostly reliable", "reliable", "not biased"):
-                return "#2ecc71"
-            if v in ("not reliable", "biased"):
-                return "#e74c3c"
+            if v in ("mostly reliable", "reliable", "not biased"): return "#2ecc71"
+            if v in ("not reliable", "biased"): return "#e74c3c"
             return "#f1c40f"
 
         st.markdown("#### 🔎 Fact-check")
@@ -751,15 +682,13 @@ if "pending_action" in st.session_state:
         s_verdict = src.get("source_reliability", "Mixed")
         st.markdown(
             f"<div style='font-weight:600;margin:.3em 0'>Source (<span style='opacity:.85'>{s_name}</span>): "
-            f"<span style='color:{_color_for(s_verdict)}'>{s_verdict}</span></div>",
-            unsafe_allow_html=True
+            f"<span style='color:{_color_for(s_verdict)}'>{s_verdict}</span></div>", unsafe_allow_html=True
         )
 
         decision = decision_json.get("bias_decision", "Unclear")
         st.markdown(
             f"<div style='font-weight:600;margin:.2em 0 .8em 0'>Bias: "
-            f"<span style='color:{_color_for(decision)}'>{decision}</span></div>",
-            unsafe_allow_html=True
+            f"<span style='color:{_color_for(decision)}'>{decision}</span></div>", unsafe_allow_html=True
         )
 
         reason = decision_json.get("decision_reasoning", "No reasoning provided.")
