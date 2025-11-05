@@ -26,8 +26,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      # ✅ scraper-only deps (no Windows TTS libs)
       - name: Install scraper deps
-        run: pip install -r scraper/requirements-app.txt
+        run: pip install -r scraper/requirements-scraper.txt
 
       - name: Run shard
         run: |
