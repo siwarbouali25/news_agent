@@ -26,7 +26,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      # ✅ scraper-only deps (no Windows TTS libs)
+      # ⚠️ IMPORTANT: scraper-only requirements (no pywin32/pyttsx3)
       - name: Install scraper deps
         run: pip install -r requirements-app.txt
 
@@ -64,13 +64,15 @@ jobs:
       - name: Merge CSVs
         run: python scripts/merge_csv.py
 
-      # ✅ robust push: base our commit on latest remote main to avoid non-fast-forward
-      - name: Commit merged CSV
+      - name: Commit merged CSV (safe, rebased on latest remote)
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # make sure local branch matches the latest remote before committing
+          # discard any local uncommitted changes from merge step
+          git reset --hard
+
+          # base commit on the latest remote main to avoid non-fast-forward
           git fetch origin
           git checkout -B main origin/main
 
