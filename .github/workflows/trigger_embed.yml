@@ -1,0 +1,50 @@
+name: Trigger Embedding Notebook
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "data/articles.csv"
+  workflow_dispatch: {}
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Normalize URL
+        run: |
+          URL="${{ secrets.WEBHOOK_URL }}"
+          # strip CR, leading/trailing spaces, and trailing slash
+          URL="$(printf '%s' "$URL" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          URL="${URL%/}"
+          echo "WEBHOOK_URL=$URL" >> "$GITHUB_ENV"
+
+      - name: Show effective URLs
+        run: |
+          echo "Health URL:  ${WEBHOOK_URL}/healthz"
+          echo "Refresh URL: ${WEBHOOK_URL}/refresh"
+
+      - name: Health check (up to 5x)
+        run: |
+          set -e
+          for i in {1..5}; do
+            echo "Health check ($i/5)…"
+            if curl -fsS "${WEBHOOK_URL}/healthz" > /dev/null; then
+              echo "OK"; exit 0
+            fi
+            sleep 5
+          done
+          echo "Health endpoint not reachable"; exit 1
+
+      - name: Trigger refresh
+        env:
+          # Only needed if your server checks a token header you added.
+          WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
+        run: |
+          echo "POST ${WEBHOOK_URL}/refresh"
+          curl -sS -D headers.txt -o body.txt -X POST \
+               -H "X-Webhook-Token: ${WEBHOOK_TOKEN}" \
+               "${WEBHOOK_URL}/refresh"
+          echo "---- headers ----"; cat headers.txt
+          echo "---- body ----"; cat body.txt
+          CODE=$(grep HTTP headers.txt | tail -1 | awk '{print $2}')
+          [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ] || { echo "Non-2xx: $CODE"; exit 1; }
