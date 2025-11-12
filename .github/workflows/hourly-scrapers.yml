@@ -28,7 +28,7 @@ jobs:
 
       # scraper-only deps (no pywin32/pyttsx3)
       - name: Install scraper deps
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-app.txt
 
       - name: Run shard
         run: |
