@@ -42,40 +42,42 @@ jobs:
           path: out/*.csv
           if-no-files-found: ignore
 
-  merge_and_commit:
-    runs-on: ubuntu-latest
-    needs: [scrape]
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+ merge_and_commit:
+  runs-on: ubuntu-latest
+  needs: [scrape]
+  permissions: { contents: write }
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0            # allow rebase
+    - uses: actions/setup-python@v5
+      with: { python-version: "3.11" }
 
-      - name: Install merge deps
-        run: pip install pandas
+    # 1) Sync to latest main FIRST
+    - name: Prepare repo (pull latest)
+      run: |
+        git config user.name  "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git fetch origin main
+        git checkout main
+        git pull --rebase origin main
 
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: staging
+    # 2) Download shard artifacts
+    - uses: actions/download-artifact@v4
+      with:
+        path: staging
 
-      - name: Merge CSVs
-        run: python scripts/merge_csv.py
+    # 3) Merge CSVs (this writes data/articles.csv)
+    - name: Merge CSVs
+      run: |
+        pip install pandas
+        python scripts/merge_csv.py
+        git status --porcelain
 
-      - name: Commit merged CSV (safe, rebased on latest remote)
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # discard any local uncommitted changes from merge step
-          git reset --hard
-
-          # base commit on the latest remote main to avoid non-fast-forward
-          git fetch origin
-          git checkout -B main origin/main
-
-          git add data/articles.csv
-          git commit -m "[skip ci] Update merged articles CSV" || echo "No changes to commit"
-          git push origin main
+    # 4) Commit & push changes (NO reset here)
+    - name: Commit merged CSV
+      run: |
+        git add data/articles.csv
+        git diff --staged --name-only || true
+        git commit -m "Update merged articles CSV [skip ci]" || echo "No changes"
+        git push origin main
